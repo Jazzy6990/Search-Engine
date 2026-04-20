@@ -11,7 +11,7 @@ A high-performance product search engine built to demonstrate core search algori
 - **Smart Recommendations**: Suggests products based on category match, similar price points, and shared keywords.
 - **Premium Dark UI**: A sleek, black-and-white, highly-responsive frontend interface.
 
-## 🏗️ Architecture
+## Architecture
 
 The system is split into three layers:
 
