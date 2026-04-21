@@ -1,6 +1,6 @@
+import sqlite3
 import json
 import math
-import re
 import time
 from pathlib import Path
 from typing import Optional
@@ -8,125 +8,14 @@ from typing import Optional
 from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
 
-# ─── LOAD PRODUCTS ────────────────────────────────────────────────────────────
+# ─── DATABASE CONNECTION ──────────────────────────────────────────────────────
 
-DATA_PATH = Path(__file__).parent.parent / "data" / "products.json"
-with open(DATA_PATH, encoding="utf-8") as f:
-    PRODUCTS: list[dict] = json.load(f)
+DB_PATH = Path(__file__).parent.parent / "data" / "search.db"
 
-
-# TRIE
-
-class TrieNode:
-    __slots__ = ("children", "is_end", "suggestions")
-
-    def __init__(self):
-        self.children: dict[str, "TrieNode"] = {}
-        self.is_end: bool = False
-        self.suggestions: list[str] = []   # up to 8 suggestions stored per node
-
-
-class Trie:
-    def __init__(self):
-        self.root = TrieNode()
-
-    def insert(self, word: str) -> None:
-        node = self.root
-        for ch in word.lower():
-            if ch not in node.children:
-                node.children[ch] = TrieNode()
-            node = node.children[ch]
-            if word not in node.suggestions and len(node.suggestions) < 8:
-                node.suggestions.append(word)
-        node.is_end = True
-
-    def get_suggestions(self, prefix: str) -> list[str]:
-        node = self.root
-        for ch in prefix.lower():
-            if ch not in node.children:
-                return []
-            node = node.children[ch]
-        return node.suggestions
-
-
-# INVERTED INDEX
-
-class InvertedIndex:
-    def __init__(self):
-        self.index: dict[str, set[int]] = {}   # token -> set of product IDs
-
-    def add(self, product_id: int, keywords: list[str]) -> None:
-        for kw in keywords:
-            for word in re.split(r"\s+", kw.lower()):
-                if word:
-                    self.index.setdefault(word, set()).add(product_id)
-
-    def _match_word(self, word: str) -> set[int]:
-        """Prefix + substring matching for a single token."""
-        result: set[int] = set()
-        for indexed_word, ids in self.index.items():
-            if indexed_word.startswith(word) or word in indexed_word:
-                result.update(ids)
-        return result
-
-    def search(self, query: str) -> set[int]:
-        """AND search with OR fallback."""
-        words = [w for w in re.split(r"\s+", query.lower()) if len(w) > 1]
-        if not words:
-            return set()
-
-        # AND search — intersect
-        result: Optional[set[int]] = None
-        for word in words:
-            matches = self._match_word(word)
-            result = matches if result is None else result & matches
-
-        # Fallback to OR if AND gives nothing
-        if not result:
-            result = set()
-            for word in words:
-                result.update(self._match_word(word))
-
-        return result
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# RANKING
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def rank_products(products: list[dict], query: str) -> list[dict]:
-    query_words = [w for w in re.split(r"\s+", query.lower()) if len(w) > 1]
-
-    scored = []
-    for p in products:
-        score = 0.0
-
-        # Build searchable text
-        kw_list = p.get("keywords", [])
-        if isinstance(kw_list, str):           # safety: handle comma-string
-            kw_list = [kw_list]
-        searchable = " ".join([p["name"].lower()] + [k.lower() for k in kw_list])
-
-        # 1) Full phrase match bonus (0 or +40)
-        if query.lower() in p["name"].lower():
-            score += 40
-
-        # 2) Per-word coverage (0–30)
-        if query_words:
-            match_count = sum(1 for w in query_words if w in searchable)
-            score += (match_count / len(query_words)) * 30
-
-        # 3) Rating (0–20)
-        score += (p.get("rating", 0) / 5) * 20
-
-        # 4) Popularity (0–10)
-        score += (p.get("popularity", 0) / 100) * 10
-
-        scored.append({**p, "_score": round(score, 1)})
-
-    scored.sort(key=lambda x: x["_score"], reverse=True)
-    return scored
-
+def get_db():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row  # Return rows as dictionaries
+    return conn
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # IN-MEMORY CACHE  (TTL = 2 minutes)
@@ -149,34 +38,13 @@ class SimpleCache:
     def set(self, key: str, value) -> None:
         self._store[key] = {"value": value, "ts": time.monotonic()}
 
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# BOOTSTRAP  (build index once on startup)
-# ═══════════════════════════════════════════════════════════════════════════════
-
-trie          = Trie()
-inv_index     = InvertedIndex()
-cache         = SimpleCache(ttl_seconds=120)
-product_map   = {p["id"]: p for p in PRODUCTS}
-
-_seen: set[str] = set()
-for product in PRODUCTS:
-    all_terms = [product["name"]] + product.get("keywords", []) + [product.get("category", "")]
-    inv_index.add(product["id"], all_terms)
-
-    for term in [product["name"]] + product.get("keywords", []):
-        if term not in _seen:
-            _seen.add(term)
-            trie.insert(term)
-
-print(f"[search_service.py] Indexed {len(PRODUCTS)} products.")
-
+cache = SimpleCache(ttl_seconds=120)
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # FASTAPI APP
 # ═══════════════════════════════════════════════════════════════════════════════
 
-app = FastAPI(title="SearchSphere Python Service", version="1.0.0")
+app = FastAPI(title="SearchSphere SQLite Service", version="1.1.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -185,6 +53,11 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+def row_to_dict(row):
+    d = dict(row)
+    if "keywords" in d and isinstance(d["keywords"], str):
+        d["keywords"] = d["keywords"].split()
+    return d
 
 # ── GET /search ───────────────────────────────────────────────────────────────
 @app.get("/search")
@@ -205,97 +78,191 @@ def search(
     if cached is not None:
         return {"success": True, "count": len(cached), "fromCache": True, "results": cached}
 
-    # 1) Candidate IDs via inverted index
-    if q.strip():
-        candidate_ids = inv_index.search(q)
+    conn = get_db()
+    cursor = conn.cursor()
+
+    # Base query combining products table and FTS5 table
+    query_str = """
+        SELECT p.*
+    """
+    
+    where_clauses = []
+    params = []
+
+    # 1. Full Text Search
+    if q and q.strip():
+        # FTS5 uses MATCH. We'll use the built-in bm25 ranking.
+        query_str += ", bm25(products_fts) AS bm25_score "
+        query_str += "FROM products p JOIN products_fts fts ON p.id = fts.rowid "
+        
+        # Clean query for FTS5 (remove special characters that might break MATCH)
+        clean_q = "".join(c for c in q if c.isalnum() or c.isspace()).strip()
+        if clean_q:
+            # We construct a query like: MATCH 'gaming* OR laptop*' for partial matching
+            # Or just use the raw query terms for exact/phrase matches
+            fts_query = " OR ".join([f"{word}*" for word in clean_q.split()])
+            where_clauses.append("products_fts MATCH ?")
+            params.append(fts_query)
     else:
-        candidate_ids = set(product_map.keys())
+        query_str += "FROM products p "
 
-    # 2) Hydrate products
-    candidates = [product_map[pid] for pid in candidate_ids if pid in product_map]
-
-    # 3) Filters
+    # 2. Hard Filters
     if category and category.lower() != "all":
-        candidates = [p for p in candidates if p.get("category", "").lower() == category.lower()]
+        where_clauses.append("p.category COLLATE NOCASE = ?")
+        params.append(category)
+        
     if min_price is not None:
-        candidates = [p for p in candidates if p.get("price", 0) >= min_price]
+        where_clauses.append("p.price >= ?")
+        params.append(min_price)
+        
     if max_price is not None:
-        candidates = [p for p in candidates if p.get("price", 0) <= max_price]
+        where_clauses.append("p.price <= ?")
+        params.append(max_price)
+        
     if min_rating is not None:
-        candidates = [p for p in candidates if p.get("rating", 0) >= min_rating]
+        where_clauses.append("p.rating >= ?")
+        params.append(min_rating)
 
-    # 4) Rank
-    ranked = rank_products(candidates, q)
+    # Combine WHERE
+    if where_clauses:
+        query_str += " WHERE " + " AND ".join(where_clauses)
 
-    # 5) Explicit sort override
+    # Execute
+    cursor.execute(query_str, params)
+    rows = cursor.fetchall()
+    
+    candidates = [row_to_dict(row) for row in rows]
+    
+    # 3. Custom Ranking + Sorting
+    for p in candidates:
+        score = 0.0
+        
+        # If we have a bm25 score, use it as a base (it's usually negative or low, lower is better in raw bm25)
+        # But we'll invert/normalize it and combine it with rating and popularity to mimic our old logic
+        bm25 = p.get("bm25_score", 0)
+        # In FTS5, bm25() returns lower values for better matches. 
+        if "bm25_score" in p:
+            # Simple conversion: 
+            score += max(0, 30 - (bm25 * 5)) 
+
+        # Add Rating and Popularity modifiers
+        score += (p.get("rating", 0) / 5) * 20
+        score += (p.get("popularity", 0) / 100) * 10
+        
+        # Exact Phrase Match Bonus
+        if q and q.strip().lower() in p["name"].lower():
+            score += 40
+            
+        p["_score"] = round(score, 1)
+        
+        # Clean up the row
+        if "bm25_score" in p:
+            del p["bm25_score"]
+
+    # Sort
     if sort == "price_asc":
-        ranked.sort(key=lambda p: p.get("price", 0))
+        candidates.sort(key=lambda p: p.get("price", 0))
     elif sort == "price_desc":
-        ranked.sort(key=lambda p: p.get("price", 0), reverse=True)
+        candidates.sort(key=lambda p: p.get("price", 0), reverse=True)
     elif sort == "rating":
-        ranked.sort(key=lambda p: p.get("rating", 0), reverse=True)
+        candidates.sort(key=lambda p: p.get("rating", 0), reverse=True)
     elif sort == "popularity":
-        ranked.sort(key=lambda p: p.get("popularity", 0), reverse=True)
+        candidates.sort(key=lambda p: p.get("popularity", 0), reverse=True)
+    else:
+        # Default: Relevance
+        candidates.sort(key=lambda p: p.get("_score", 0), reverse=True)
 
-    cache.set(cache_key, ranked)
-    return {"success": True, "count": len(ranked), "fromCache": False, "results": ranked}
+    conn.close()
 
+    cache.set(cache_key, candidates)
+    return {"success": True, "count": len(candidates), "fromCache": False, "results": candidates}
 
 # ── GET /autocomplete ─────────────────────────────────────────────────────────
 @app.get("/autocomplete")
 def autocomplete(q: str = Query(default="")):
     if not q.strip():
         return {"success": True, "suggestions": []}
-    suggestions = trie.get_suggestions(q.strip())
-    return {"success": True, "suggestions": suggestions}
+        
+    clean_q = "".join(c for c in q if c.isalnum() or c.isspace()).strip()
+    if not clean_q:
+        return {"success": True, "suggestions": []}
 
+    conn = get_db()
+    cursor = conn.cursor()
+    
+    # Use FTS5 prefix matching
+    # E.g., MATCH 'wire*' against the name column
+    fts_query = f"^{clean_q}*" 
+    
+    cursor.execute("""
+        SELECT p.name 
+        FROM products p 
+        JOIN products_fts fts ON p.id = fts.rowid
+        WHERE products_fts MATCH ?
+        LIMIT 8
+    """, (fts_query,))
+    
+    rows = cursor.fetchall()
+    suggestions = [row["name"] for row in rows]
+    conn.close()
+    
+    return {"success": True, "suggestions": suggestions}
 
 # ── GET /recommendations/{id} ─────────────────────────────────────────────────
 @app.get("/recommendations/{product_id}")
 def recommendations(product_id: int):
-    product = product_map.get(product_id)
-    if not product:
+    conn = get_db()
+    cursor = conn.cursor()
+    
+    # Get base product
+    cursor.execute("SELECT * FROM products WHERE id = ?", (product_id,))
+    base_row = cursor.fetchone()
+    
+    if not base_row:
+        conn.close()
         return {"success": False, "recommendations": []}
+        
+    base_product = row_to_dict(base_row)
+    
+    # Find similar products based on category and price proximity
+    min_p = base_product["price"] * 0.5
+    max_p = base_product["price"] * 1.5
+    cat = base_product["category"]
+    
+    cursor.execute("""
+        SELECT * FROM products 
+        WHERE id != ? AND category = ? AND price BETWEEN ? AND ?
+        LIMIT 6
+    """, (product_id, cat, min_p, max_p))
+    
+    rows = cursor.fetchall()
+    recs = [row_to_dict(row) for row in rows]
+    conn.close()
 
-    scored = []
-    for p in PRODUCTS:
-        if p["id"] == product_id:
-            continue
-        score = 0
-
-        # Same category → big bonus
-        if p.get("category") == product.get("category"):
-            score += 40
-
-        # Price proximity (within ±50%) → up to +20
-        base_price = product.get("price") or 1
-        price_diff = abs(p.get("price", 0) - product.get("price", 0)) / base_price
-        if price_diff < 0.5:
-            score += 20 - math.floor(price_diff * 20)
-
-        # Keyword overlap → +5 per shared keyword
-        kw_a = set(product.get("keywords", []))
-        kw_b = set(p.get("keywords", []))
-        score += len(kw_a & kw_b) * 5
-
-        scored.append({**p, "_score": score})
-
-    scored.sort(key=lambda x: x["_score"], reverse=True)
-    return {"success": True, "recommendations": scored[:6]}
-
+    return {"success": True, "recommendations": recs}
 
 # ── GET /categories ───────────────────────────────────────────────────────────
 @app.get("/categories")
 def categories():
-    cats = sorted({p.get("category", "") for p in PRODUCTS if p.get("category")})
+    conn = get_db()
+    cursor = conn.cursor()
+    cursor.execute("SELECT DISTINCT category FROM products ORDER BY category")
+    rows = cursor.fetchall()
+    cats = [row["category"] for row in rows if row["category"]]
+    conn.close()
+    
     return {"success": True, "categories": cats}
-
 
 # ── GET /health ───────────────────────────────────────────────────────────────
 @app.get("/health")
 def health():
-    return {"status": "ok", "products": len(PRODUCTS), "engine": "python-fastapi"}
-
+    conn = get_db()
+    cursor = conn.cursor()
+    cursor.execute("SELECT COUNT(*) as c FROM products")
+    count = cursor.fetchone()["c"]
+    conn.close()
+    
+    return {"status": "ok", "products": count, "engine": "sqlite-fts5"}
 
 # ─── Entry point ──────────────────────────────────────────────────────────────
 if __name__ == "__main__":
